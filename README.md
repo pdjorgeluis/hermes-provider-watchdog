@@ -1,17 +1,37 @@
-# Provider-Failure Watchdog — Reference & Documentation
+# hermes-provider-watchdog
 
-**What it is:** an independent, zero-LLM-cost watchdog that watches a Hermes
-Agent household's LLM provider health by grepping the agents' own logs, probes
-the provider with a 1-token request when failures accumulate, and acts on a
-probe-gated decision tree: restart poisoned gateway processes, or enforce
-total silence during a provider-side outage — paging the operator's Telegram
-DM directly either way. Every alert carries a live burn-rate snapshot.
+**Provider failover watchdog for Hermes Agent.** Monitors NVIDIA NIM endpoint model
+availability, triggers automatic failover on terminal/soft failure signatures, and
+includes a child-worker watchdog for silent kanban child worker spawns. Tested
+hermetically with zero network (51/51 tests green).
 
-**Design law:** *a watcher must not depend on the watched.* It is a plain
-Python 3 script + systemd user timer, fully outside every Hermes process. It
-spends zero API requests on healthy runs (only the burn snapshot + log grep,
-~1.6 s CPU), and its pager talks to the Telegram Bot API directly — if every
-gateway is dead, the watchdog still rings.
+| | |
+|---|---|
+| **Owner** | pdjorgeluis |
+| **Status** | Active — DRY_RUN=1 until operator arms live mode |
+| **License** | MIT |
+| **Tests** | 51 (hermetic, zero network) |
+
+---
+
+## What it is
+
+An independent, zero-LLM-cost watchdog that watches a Hermes Agent household's
+LLM provider health by grepping the agents' own logs, probes the provider with a
+1-token request when failures accumulate, and acts on a probe-gated decision
+tree: restart poisoned gateway processes, or enforce total silence during a
+provider-side outage — paging the operator's Telegram DM directly either way.
+Every alert carries a live burn-rate snapshot.
+
+It also includes a **child-worker watchdog** (`child_worker_watchdog.py`) that
+monitors kanban child workers for silent spawns: time-to-first-token, stale
+heartbeat, dead pid. Notifies the operator on detection. DRY_RUN=1 by default.
+
+**Design law:** *a watcher must not depend on the watched.* It is a plain Python 3
+script + systemd user timer, fully outside every Hermes process. It spends zero
+API requests on healthy runs (only the burn snapshot + log grep, ~1.6 s CPU),
+and its pager talks to the Telegram Bot API directly — if every gateway is
+dead, the watchdog still rings.
 
 **To install this on any Hermes:** follow **`INSTALL.md`** (same directory) —
 the complete agent-executable procedure, phases A–G, with generic paths. The
@@ -20,13 +40,31 @@ no drift). This file is the reference: how it works, how to operate and tune
 it, and why it is shaped this way.
 
 **Path convention:** examples use `$WATCHDOG_DIR` = wherever this `watchdog/`
-directory is staged on the machine (the code resolves everything else
-relative to itself), and `$ENV_FILE` = the install's Hermes env file.
+directory is staged on the machine (the code resolves everything else relative
+to itself), and `$ENV_FILE` = the install's Hermes env file.
 
 **Origin:** built for Master Jorge's household (cards t_84db71fa →
 t_f35dec9e, spec `provider-failure-watchdog-plan.md` rev 2). The hermetic
-26-test suite is the smith's craft (Sindri); the implementation is the
-steward's (Crimvael). It runs in **DRY_RUN=1** until the operator arms it.
+test suite is the smith's craft (Sindri); the implementation is the steward's
+(Crimvael). It runs in **DRY_RUN=1** until the operator arms it.
+
+---
+
+## Contents
+
+| File | Purpose |
+|---|---|
+| `provider_watchdog.py` | Main watchdog: burn/detect/probe/decide/notify cycle |
+| `provider_watchdog.sh` | Shell wrapper |
+| `child_worker_watchdog.py` | Child-worker silent-spawn watchdog |
+| `child_worker_watchdog.sh` | Child-worker shell wrapper |
+| `selftest_notify.py` | Self-test notification helper |
+| `INSTALL.md` | Install / arm / rollback procedure (phases A–G) |
+| `watchdog-fix-spec-2026-10-18.md` | Design spec for the correctness fix |
+| `tests/test_provider_watchdog.py` | Provider watchdog test suite |
+| `tests/test_child_worker_watchdog.py` | Child-worker watchdog tests |
+| `state/` | Runtime state (gitignored) |
+| `state-child-worker/` | Child-worker state |
 
 ---
 
@@ -44,8 +82,8 @@ burn ──► detect ──► (triggered?) ──► probe ──► decide �
 ### 1.1 Burn (Level 0 observability — always on)
 
 Parses `API call #…in=X out=Y` lines from every profile's `agent.log` over the
-**last 600 s, family-wide**, and computes (THE RULING — one formula feeds the
-snapshot file AND every notification text):
+**last 600 s, family-wide**, and computes (**THE RULING** — one formula feeds
+the snapshot file AND every notification text):
 
 - `requests_per_min` = (count of API-call lines in window) / 10, one decimal
 - `tokens_per_min` = (sum of in+out across those lines) / 10, one decimal
@@ -69,13 +107,9 @@ both count once) for these signatures:
 
 Semantics (bound to the test suite):
 
-- **blip** — 1 signature line inside the 5-min window in one profile → **no
-  trigger** (Hermes's own retry ladder handles blips).
-- **sustained** — ≥2 lines inside the 5-min window in one profile, OR ≥2 lines
-  with at least one recent and the rest inside a 15-min lookback → trigger.
-- **multi-profile** — ≥2 profiles each with ≥1 recent line → trigger, even if
-  young (known false-positive risk: one blip in each of two profiles; watch it
-  during the dry-run week).
+- **blip** — 1 signature line inside the 5-min window in one profile → **no trigger** (Hermes's own retry ladder handles blips).
+- **sustained** — ≥2 lines inside the 5-min window in one profile, OR ≥2 lines with at least one recent and the rest inside a 15-min lookback → trigger.
+- **multi-profile** — ≥2 profiles each with ≥1 recent line → trigger, even if young (known false-positive risk: one blip in each of two profiles; watch it during the dry-run week).
 - Priority: multi-profile > sustained > blip > none.
 
 ### 1.3 Probe (only on trigger)
@@ -89,13 +123,14 @@ verbatim to `state/last_429_body.txt` for evidence; the scrubbed body goes to
 
 ### 1.4 Decide (the probe-gated tree)
 
-**Probe OK, agents failing** → verdict: *our processes are poisoned; the
-provider is open to fresh connections.* Remedy: `systemctl --user restart` of
-the affected gateway service(s); if ≥2 profiles are affected, restart all. The
+**Probe OK, agents failing** → verdict: *our processes are poisoned; the provider
+is open to fresh connections.* Remedy: `systemctl --user restart` of the
+affected gateway service(s); if ≥2 profiles are affected, restart all. The
 process restart is the proven cure (a session reset is not the lever).
 
 **Probe FAILS** → verdict: *key-level cooldown or provider outage.* Remedy:
 **total silence, then fresh start.**
+
 1. Page the operator's DM immediately: silence enforced.
 2. Guaranteed quiet window (default 5 min) — no probes at all; the watchdog
    itself goes sparse (one probe per 5 min) until recovery.
@@ -113,8 +148,7 @@ process restart is the proven cure (a session reset is not the lever).
   burns the real budgets.
 - `WATCHDOG_PAUSE_CRON=1` (OFF by default): attempts `hermes cron pause`
   during silence. Caveat: that CLI pauses per-job, not globally — do not
-  enable unless the operator has named the jobs or authorized another
-  mechanism.
+  enable unless the operator has named the jobs or authorized another mechanism.
 
 ### 1.6 DRY_RUN (delivered state)
 
@@ -157,7 +191,22 @@ Environment overrides: `DRY_RUN`, `WATCHDOG_STATE_DIR`, `WATCHDOG_ENV_FILE`,
 
 ---
 
-## 2. Operations cheat-sheet
+## 2. Child-Worker Watchdog
+
+Monitors kanban child workers for silent spawns:
+
+- **time-to-first-token** — worker claims a task but never produces a heartbeat
+- **stale heartbeat** — heartbeat age exceeds threshold
+- **dead pid** — `ps -p <pid>` confirms the worker process is gone
+
+Runs as a systemd user oneshot + timer (every 2 minutes), `DRY_RUN=1` by
+default. Notifies the operator on detection.
+
+See `child_worker_watchdog.py` and `child_worker_watchdog.sh` for details.
+
+---
+
+## 3. Operations cheat-sheet
 
 - **Install / arm / rollback:** see `INSTALL.md` (the single procedure copy).
 - **Health at a glance:** `tail "$WATCHDOG_DIR/state/watchdog.log"`
@@ -187,7 +236,9 @@ profile is born (or one retires):
 
 Rollback: remove the name from the line and `daemon-reload` again.
 
-## 3. Tuning constants (top of `provider_watchdog.py`)
+---
+
+## 4. Tuning constants (top of `provider_watchdog.py`)
 
 | Constant | Default | Meaning |
 |---|---|---|
@@ -215,7 +266,9 @@ Any change to burn semantics must keep ONE formula feeding snapshot and
 notification (THE RULING), and the test suite is rewritten to match a binding
 ruling — never the reverse.
 
-## 4. Design invariants (why it is shaped this way)
+---
+
+## 5. Design invariants (why it is shaped this way)
 
 1. **Independent of the watched** — plain script + timer; no Hermes process,
    no LLM calls on healthy runs; pager rides the Bot API directly.
@@ -229,5 +282,30 @@ ruling — never the reverse.
    logs, never state files; key NAMES may be logged, values never.
 6. **Every page carries the burn line** — observability ships with the alarm.
 
-*Authored by Crimvael, steward, at Master Jorge's order — 2026-10-16. The
-suite is Sindri's craft; the house keeps it green.*
+---
+
+## 6. 2026-10-18 Correctness Fix
+
+Six defects fixed in `provider_watchdog.py` plus an auth-header repair:
+
+| Defect | Fix |
+|---|---|
+| A | Probe model now resolves from `WATCHDOG_PROBE_MODEL` env → profile `model.default` → `WATCHDOG_FALLBACK_MODEL` → module constant; source logged |
+| B | Multi-model probe: `ok` is True if ANY model answers |
+| C | `TERMINAL_SIGNATURES` trigger restarts; `SOFT_SIGNATURES` recorded only |
+| D | Stable notification class keys + 600s hard floor on restart-intent classes; every suppression logged |
+| E | Restart skipped + `model_rotation_needed` when recovery comes on a non-default model (decision path) |
+| F | Restart skipped + `model_rotation_needed` on silence-recovery path |
+
+**Auth-header repair:** The probe's curl `--config` now carries the real API
+key (transient, 0600, argv-clean). The literal `Bearer ***` f-string from the
+original strike is gone.
+
+**Test suite:** 29 → 51 tests, all green (51/51, rc 0), hermetic, zero network.
+
+Four pre-existing tests amended, each citing defect C in an in-test comment
+(they had encoded the old raw-signature behavior).
+
+---
+
+*Authored by Crimvael, steward, at Master Jorge's order — 2026-10-16.\nThe suite is Sindri's craft; the house keeps it green.*

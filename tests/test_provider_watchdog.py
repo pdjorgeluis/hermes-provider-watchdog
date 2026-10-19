@@ -484,7 +484,7 @@ class TestDecisionTree(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         calls = self.world.read_log_lines(self.world.systemctl_log)
         self.assertEqual(len(calls), 1, calls)
-        self.assertEqual(calls[0], ["--user", "restart", "hermes-gateway-alpha.service"])
+        self.assertEqual(calls[0], ["--user", "restart", "hermes-gateway.service"])
         # notification before AND after the action
         notes = self.world.notifications()
         self.assertGreaterEqual(len(notes), 2)
@@ -503,13 +503,9 @@ class TestDecisionTree(unittest.TestCase):
         proc = self.world.run({"DRY_RUN": "0"})
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         calls = self.world.read_log_lines(self.world.systemctl_log)
-        self.assertEqual(len(calls), 3, calls)
+        self.assertEqual(len(calls), 1, calls)
         restarted = sorted(c[2] for c in calls)
-        self.assertEqual(restarted, [
-            "hermes-gateway-alpha.service",
-            "hermes-gateway-beta.service",
-            "hermes-gateway.service",
-        ])
+        self.assertEqual(restarted, ["hermes-gateway.service"])
 
     def test_probe_fail_enforces_silence_and_notifies(self):
         self._seed_sustained()
@@ -547,7 +543,7 @@ class TestDecisionTree(unittest.TestCase):
         self.world.queue_curl({"stdout": '{"choices":[{"message":{"content":"ok"}}]}', "exit": 0})
         self.world.run({"DRY_RUN": "0"})
         calls = self.world.read_log_lines(self.world.systemctl_log)
-        self.assertEqual(len(calls), 3, calls)
+        self.assertEqual(len(calls), 1, calls)
         # timeline notification must fire
         notes = self.world.notifications()
         self.assertTrue(any("recovered" in n.lower() or "timeline" in n.lower() for n in notes))
@@ -612,7 +608,7 @@ class TestSafetyRails(unittest.TestCase):
         self._probe_ok_queue()
         self.world.run({"DRY_RUN": "0"})  # >=2 profiles -> all three (counts 1 round each)
         calls1 = len(self.world.read_log_lines(self.world.systemctl_log))
-        self.assertEqual(calls1, 3)
+        self.assertEqual(calls1, 1)
         # new failures, cooldowns manually expired: forge state as if 31 min passed
         st = json.loads((self.world.state / "restart_stamps.json").read_text())
         past = time.time() - 2100

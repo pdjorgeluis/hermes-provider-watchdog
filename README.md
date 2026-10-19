@@ -183,8 +183,11 @@ Environment overrides: `DRY_RUN`, `WATCHDOG_STATE_DIR`, `WATCHDOG_ENV_FILE`,
 - A Hermes layout of this machine's age: default profile logs at
   `~/.hermes/logs/`, other profiles at `~/.hermes/profiles/<name>/logs/`
   (`agent.log` + `errors.log` each).
-- Gateway systemd units named `hermes-gateway.service` (default profile) and
-  `hermes-gateway-<profile>.service` (others).
+- A **single multiplexed gateway unit** `hermes-gateway.service` serves all
+  profiles (default, Isis, Sindri). There are no per-profile gateway units
+  post-multiplex migration; `service_name()` returns this unit for every
+  profile. (On a non-multiplex install, edit `service_name()` in
+  `provider_watchdog.py` — see INSTALL.md §Phase B.)
 - An env file containing the provider API key and the Telegram bot token as
   `KEY=VALUE` lines (both read at runtime; values never persisted anywhere).
 - Telegram: the bot must be able to DM the operator's chat id.
@@ -224,7 +227,7 @@ profile is born (or one retires):
 
 1. Prereqs hold automatically for standard Hermes profiles: logs at
    `~/.hermes/profiles/<name>/logs/agent.log` + `errors.log`, gateway unit
-   named `hermes-gateway-<profile>.service`.
+   named `hermes-gateway.service` (the multiplexed gateway serves all profiles).
 2. Edit the service unit's `Environment=WATCHDOG_PROFILES=…` line
    (comma-separated; the `default` profile covers `~/.hermes/logs/`).
 3. `systemctl --user daemon-reload` — the next timer tick (≤2 min) watches

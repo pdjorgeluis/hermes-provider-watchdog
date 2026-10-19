@@ -195,9 +195,16 @@ def log_paths(profile: str):
 
 
 def service_name(profile: str) -> str:
-    if profile == "default":
-        return "hermes-gateway.service"
-    return f"hermes-gateway-{profile}.service"
+    """Systemd unit name for a profile's gateway.
+
+    Multiplex mode (post 2026-10-18 migration): one gateway unit
+    (hermes-gateway.service) serves ALL profiles — Isis, Sindri, and the
+    steward default. There are no per-profile gateway units anymore; the
+    standalone hermes-gateway-isis.service and hermes-gateway-sindri.service
+    were folded into the multiplexed gateway. Return the single unit for
+    every profile so restart_round() targets the unit that actually exists.
+    """
+    return "hermes-gateway.service"
 
 
 def dry_run() -> bool:
@@ -603,10 +610,17 @@ def restart_round(secrets: dict, burn: dict, target_profiles: list, recovered=Fa
     why = "recovery: 2 consecutive OK probes" if recovered else "probe OK, agents poisoned"
     notify(secrets, f"watchdog: restarting {', '.join(services)} NOW ({why}).\n{burn_line(burn)}",
            "pre_restart", cls="pre_restart")
+    # Multiplex mode: one gateway unit serves all profiles. Deduplicate
+    # services so a multi-profile trigger doesn't restart the same unit
+    # repeatedly; stamp every affected profile's cooldown regardless.
+    service_to_profiles: dict[str, list[str]] = {}
     for p in targets:
-        subprocess.run(["systemctl", "--user", "restart", service_name(p)],
+        service_to_profiles.setdefault(service_name(p), []).append(p)
+    for svc, profs in service_to_profiles.items():
+        subprocess.run(["systemctl", "--user", "restart", svc],
                       capture_output=True, timeout=60)
-        stamps[p] = now
+        for p in profs:
+            stamps[p] = now
     rounds.append(now)
     write_json("restart_stamps.json", stamps)
     write_json("rounds.json", rounds)

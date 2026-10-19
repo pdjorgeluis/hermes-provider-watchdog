@@ -1,8 +1,8 @@
 # Provider-Failure Watchdog — Research Findings & Proposed Plan (rev 2)
 
-**Author:** Crimvael, steward — researched at Master's order, 2026-10-14; **revised the same evening after Master's opencode evidence**
-**Status:** DRAFT rev 2 — awaiting Master's review. Nothing below is built or enabled.
-**What rev 2 changes:** the rev-1 "429 → do nothing" level is DEAD. Master's manual tests prove the sustained-throttle state is not cured by waiting and not cured by session resets — only by a full process restart. The plan is rebuilt around one probe-centered decision tree whose remedy of record is **total silence + fresh process**.
+**Author:** steward — researched at operator's order; **revised** after operator's evidence
+**Status:** DRAFT rev 2 — awaiting operator's review. Nothing below is built or enabled.
+**What rev 2 changes:** the rev-1 "429 → do nothing" level is DEAD. Operator's manual tests prove the sustained-throttle state is not cured by waiting and not cured by session resets — only by a full process restart. The plan is rebuilt around one probe-centered decision tree whose remedy of record is **total silence + fresh process**.
 
 ---
 
@@ -13,15 +13,14 @@
 - When the 40-RPM limit (or a hidden spend rule) trips in earnest: **increasing the retry delay does NOT recover.**
 - **Starting a new session (`/new`) does NOT recover.**
 - **ONLY closing the CLI entirely and reopening recovers.**
-- Implication: the poison is **process-level, not session-level** — the HTTP connection pool, TLS session state, or an in-process limiter — possibly combined with a hidden server-side rule: a cooldown keyed to the API key, or to cumulative token/request spend. (A TPM bucket is plausible for us specifically: household requests run 50–90k input tokens each — one fat request could drain a per-minute token budget that 40 RPM nominally allows.)
+- Implication: the poison is **process-level, not session-level** — the HTTP connection pool, TLS session state, or an in-process limiter — possibly combined with a hidden server-side rule: a cooldown keyed to the API key, or to cumulative token/request spend. (A TPM bucket is plausible for some installations: large requests run significant input tokens each — one fat request could drain a per-minute token budget that a nominal RPM limit allows.)
 - **Design consequence:** we stay cause-agnostic about NVIDIA's hidden rules — we cannot see them; we can only behave correctly against their observed symptoms. The remedy of record is what your tests proved works: **total silence, then a fresh process.** Waiting alone is insufficient; session resets alone are insufficient.
 
 ### 1.2 Translation to Hermes
 
 - Hermes's "close the CLI and reopen" = **restarting the gateway services** — the processes that own the HTTP clients and connection pools to nvidia. Not session resets (your `/new` evidence rules them out as the lever), not longer waits.
-- A brief 429 blip inside the normal ~60s window still self-heals (Hermes honors Retry-After; the single 429 in household history, 10-08, did exactly that). **The danger state is sustained throttle: failures continuing for minutes despite the ladder's own waits.** Working definition: Retry-After honored, but failure signatures persist ≥5 minutes.
-- This morning's 12:29 incident remains classified an OUTAGE (timeouts → DEGRADED 400 → 404s) — but note it was cured by the VM restart, which is *the same remedy shape*: total silence + fresh processes. The two diseases share the cure; **the probe tells them apart.**
-- **Probes are requests too.** If a hidden cooldown renews on any request, even a 1-token probe could extend it (inference, marked — unverifiable from outside). Therefore: probes during the silence phase are **sparse** (first probe after the quiet period, then every 5 minutes), and always from a **fresh connection** — plain `curl`, a new process per probe, immune to the connection-pinning your tests suggest.
+- A brief 429 blip inside the normal ~60s window still self-heals (Hermes honors Retry-After). **The danger state is sustained throttle: failures continuing for minutes despite the ladder's own waits.** Working definition: Retry-After honored, but failure signatures persist ≥5 minutes.
+- **Probes are requests too.** If a hidden cooldown renews on any request, even a 1-token probe could extend it (inference, marked — unverifiable from outside). Therefore: probes during the silence phase are **sparse** (first probe after the quiet period, then every 5 minutes), and always from a **fresh connection** — plain `curl`, a new process per probe, immune to connection-pinning.
 
 ---
 
@@ -43,22 +42,22 @@ One 1-token chat completion: fresh `curl`, family key, 15s timeout, body capture
 
 ### Step 2b — Probe FAILS
 **Verdict: key-level hidden cooldown, or a provider outage.** Remedy — total silence, then fresh start:
-1. **Notify your DM immediately**: sustained throttle/outage detected; silence enforced.
-2. **Enforce quiet**: the watchdog itself goes sparse (first probe after the silence window, then every 5 min) — and every other household request is suspect during a cooldown: the notification asks for (or performs, if authorized — decision 6) a pause of household cron jobs. Zero requests is the state your CLI-close achieved; nothing less certain.
-3. **On 2 consecutive probe successes**: restart ALL gateway services once — fresh processes are the only proven cure — then notify your DM with the full timeline and the burn snapshot.
-4. Log everything to `~/household/watchdog/`.
+1. **Notify the operator's DM immediately**: sustained throttle/outage detected; silence enforced.
+2. **Enforce quiet**: the watchdog itself goes sparse (first probe after the silence window, then every 5 min) — and every other request is suspect during a cooldown: the notification asks for (or performs, if authorized — decision 6) a pause of cron jobs. Zero requests is the state achieved by closing the CLI; nothing less certain.
+3. **On 2 consecutive probe successes**: restart ALL gateway services once — fresh processes are the only proven cure — then notify with the full timeline and the burn snapshot.
+4. Log everything to `~/.hermes/watchdog/`.
 
 **What replaces the fixed 5-minute wait:** the silence default is 5 minutes of *guaranteed quiet* (configurable), but recovery is **probe-gated, not clock-gated** — we act on evidence the provider answers, never sooner, never blindly later.
 
-**ADDENDUM (2026-10-15, Master's order — applies to ALL household plans, exemplified here):** long tasks on the nvidia free tier are to be **planned as small parts, each landable in one short session**. Proven failure mode: single long streaming turns at high context die (4 crashes at 45–54k context on this very card). The counter-method is codified in the request-budget skill (small-strikes discipline): plan small parts before starting, one write per turn, artifacts on disk early, sessions chained by files rather than one growing stream, cheap-resume notes for every fresh session. Spec-writers: every future household plan bakes this in from the start — the commissioning brief itself should name the parts.
+**ADDENDUM (operator's order — applies to ALL plans, exemplified here):** long tasks on a free-tier provider are to be **planned as small parts, each landable in one short session**. Proven failure mode: single long streaming turns at high context die. The counter-method: plan small parts before starting, one write per turn, artifacts on disk early, sessions chained by files rather than one growing stream, cheap-resume notes for every fresh session. Spec-writers: every future plan bakes this in from the start — the commissioning brief itself should name the parts.
 
 ---
 
 ## 3. Implementation sketch
 
 ```
-~/household/watchdog/provider_watchdog.sh     (the script)
-~/household/watchdog/state/                    (probe history, restart stamps, burn window)
+~/.hermes/watchdog/provider_watchdog.sh     (the script)
+~/.hermes/watchdog/state/                    (probe history, restart stamps, burn window)
 ~/.config/systemd/user/hermes-watchdog.timer   (every 2 min, Persistent=true)
 ~/.config/systemd/user/hermes-watchdog.service (short-lived, runs the script)
 ```

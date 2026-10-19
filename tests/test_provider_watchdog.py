@@ -999,11 +999,10 @@ class TestProbeModelResolution(unittest.TestCase):
         self.assertNotIn("config-should-lose/model", " ".join(argv))
 
     def test_module_constant_when_nothing_configured(self):
-        # no config files, no env override -> module constant, source logged
+        # no config files, no env override -> module constant (empty), source logged
         res = self._probe_result()
-        self.assertEqual(res["model"], "stepfun-ai/step-5-preview", res)
+        self.assertEqual(res["model"], "", res)
         argv = self.world.read_log_lines(self.world.curl_log)[0]
-        self.assertIn("stepfun-ai/step-5-preview", " ".join(argv))
         self.assertIn("constant", self.world.main_log())
 
 

@@ -1,26 +1,24 @@
 # Commission: Provider-Failure Watchdog — build, install (dry-run), verify
 
-**Dispatched by Crimvael, steward, by Master's order, 2026-10-14.**
-**SPEC (authoritative, read it first): `~/household/watchdog/provider-failure-watchdog-plan.md` (rev 2).** It is attached to this card as well. Every design decision in it is Master-ratified — implement it as written; where the spec marks something inference, the script must behave conservatively exactly as the spec says.
+**SPEC (authoritative, read it first): `~/.hermes/watchdog/provider-failure-watchdog-plan.md` (rev 2).** Every design decision in it is operator-ratified — implement it as written; where the spec marks something inference, the script must behave conservatively exactly as the spec says.
 
 ## What you are building
 
 An independent watchdog (bash or python, your call) + systemd user timer + service:
 
-1. **Detection** — scan the last 5 minutes of the household's agent/error logs for the failure signatures listed in the spec §Trigger:
+1. **Detection** — scan the last 5 minutes of the agent/error logs for the failure signatures listed in the spec §Trigger:
    - default profile: `~/.hermes/logs/agent.log`, `~/.hermes/logs/errors.log`
-   - isis: `~/.hermes/profiles/isis/logs/{agent,errors}.log`
-   - sindri: `~/.hermes/profiles/sindri/logs/{agent,errors}.log`
-   Signatures (verified against the real 2026-10-14 outage): `failure_reason` stamps `rate_limit|server_error|timeout|connection`, `API call failed`, `API failed after`, `DEGRADED function cannot be invoked`, `Clean EOF, no finish_reason`, `Streaming failed before delivery`, HTTP 429/404 lines. Trigger = sustained (signatures persisting ≥5 min) OR ≥2 profiles failing within the window. Brief self-healed blips must NOT trigger.
+   - other profiles: `~/.hermes/profiles/<name>/logs/{agent,errors}.log`
+   Signatures (verified against real outage lines): `failure_reason` stamps `rate_limit|server_error|timeout|connection`, `API call failed`, `API failed after`, `DEGRADED function cannot be invoked`, `Clean EOF, no finish_reason`, `Streaming failed before delivery`, HTTP 429/404 lines. Trigger = sustained (signatures persisting ≥5 min) OR ≥2 profiles failing within the window. Brief self-healed blips must NOT trigger.
 2. **Probe** — one 1-token chat completion via fresh `curl --max-time 15` against `https://integrate.api.nvidia.com/v1/chat/completions` using `NVIDIA_API_KEY` from `~/.hermes/.env` (NEVER print the key or full auth header; log response body to the state dir only after scrubbing). Sparse probing per spec: during silence, first probe after the quiet window, then every 5 min.
 3. **Decision tree** — spec §2 exactly:
    - Probe OK + agents failing → restart the multiplexed gateway (`systemctl --user restart hermes-gateway.service` — serves all profiles); ≥2 profiles → restart once.
    - Probe FAILS → notify Master, enforce silence, sparse-probe; on 2 consecutive successes restart the gateway once, notify with timeline.
 4. **Level 0 burn-rate** — parse `API call #N: ... in=X out=Y ...` lines into a rolling 10-min family requests/min + tokens/min estimate; include the snapshot in every notification. Also capture any 429 response body verbatim to the state dir.
-5. **Notifications** — direct Telegram Bot API message to Master's DM (chat 8735869705) using `TELEGRAM_BOT_TOKEN` from `~/.hermes/.env` — no Hermes dependency, key never printed. Notify BEFORE and AFTER every action.
+5. **Notifications** — direct Telegram Bot API message to the operator's DM using `TELEGRAM_BOT_TOKEN` from `~/.hermes/.env` — no Hermes dependency, key never printed. Notify BEFORE and AFTER every action.
 6. **DRY-RUN IS THE DEFAULT**: `DRY_RUN=1` (state file or env) → detect + probe + notify only; NO systemctl restarts ever execute; notifications say "DRY-RUN" prominently. Master arms it himself after the dry-run week.
-7. **Safety rails**: one restart round per profile per 30 min; one silence cycle per hour; >2 restarts in an hour → stop acting, notify "manual attention needed"; state under `~/household/watchdog/state/`; log to `~/household/watchdog/watchdog.log` with timestamps.
-8. As part of the build, verify the CLI path for pausing household cron jobs (`hermes cron --help`) and implement `--pause-cron` BEHIND a config flag, default OFF (Master decides when to enable).
+7. **Safety rails**: one restart round per profile per 30 min; one silence cycle per hour; >2 restarts in an hour → stop acting, notify "manual attention needed"; state under `~/.hermes/watchdog/state/`; log to `~/.hermes/watchdog/watchdog.log` with timestamps.
+8. As part of the build, verify the CLI path for pausing cron jobs (`hermes cron --help`) and implement `--pause-cron` BEHIND a config flag, default OFF (operator decides when to enable).
 
 ## Method (your iron laws apply)
 
@@ -44,4 +42,4 @@ An independent watchdog (bash or python, your call) + systemd user timer + servi
 - Request-budget discipline: the whole card should cost the family pool a handful of requests; one live probe, one DM, no more.
 - The watched processes are your family's gateways: treat `systemctl --user restart` code paths with the respect of a smith — tested, gated, capped.
 
-— Crimvael, steward, by Master's order
+— steward, by operator's order

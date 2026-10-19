@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provider-failure watchdog for a Hermes Agent household.
+"""Provider-failure watchdog for a Hermes Agent installation.
 
 A boring log-grepper, run every 2 minutes by hermes-watchdog.timer:
   1. burn    — family-wide requests/min + tokens/min over the last 10 min (THE RULING)
@@ -50,8 +50,10 @@ NOTIFY_MIN_INTERVAL_S = 600  # hard floor between restart-intent notifications p
 RESTART_INTENT_CLASSES = ("would_restart", "pre_restart", "post_restart",
                           "cooldown", "manual_attention")
 DEFAULT_PROFILES = ("default",)  # neutral; per-install list comes from WATCHDOG_PROFILES
-API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-DEFAULT_PROBE_MODEL = "stepfun-ai/step-5-preview"  # last-resort constant, source logged
+API_URL = os.environ.get("WATCHDOG_API_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
+DEFAULT_PROBE_MODEL = os.environ.get("WATCHDOG_PROBE_MODEL", "")  # last-resort constant; empty means unset
+DEFAULT_API_KEY_ENV = os.environ.get("WATCHDOG_API_KEY_ENV", "NVIDIA_API_KEY")
+DEFAULT_NOTIFY_TOKEN_ENV = os.environ.get("WATCHDOG_NOTIFY_TOKEN_ENV", "TELEGRAM_BOT_TOKEN")
 
 # ---------------- failure signature tiers (defect C) ----------------
 # TERMINAL: lines that prove the provider gave up on that call. These ALONE
@@ -159,7 +161,7 @@ def probe_models() -> list:
 
 
 def household_default_model() -> str:
-    """The model the household runs when all is well (defects E/F's yardstick).
+    """The configured default model (defects E/F's yardstick).
 
     Same resolution as probe_models() minus the fallback/env-probe escape
     hatches: the configured model, else the module constant. Never ''.
@@ -179,7 +181,7 @@ def chat_id() -> str:
 
 def state_dir() -> Path:
     d = os.environ.get("WATCHDOG_STATE_DIR")
-    return Path(d) if d else home_dir() / "household" / "watchdog" / "state"
+    return Path(d) if d else home_dir() / ".hermes" / "watchdog" / "state"
 
 
 def env_file() -> Path:
@@ -197,12 +199,10 @@ def log_paths(profile: str):
 def service_name(profile: str) -> str:
     """Systemd unit name for a profile's gateway.
 
-    Multiplex mode (post 2026-10-18 migration): one gateway unit
-    (hermes-gateway.service) serves ALL profiles — Isis, Sindri, and the
-    steward default. There are no per-profile gateway units anymore; the
-    standalone hermes-gateway-isis.service and hermes-gateway-sindri.service
-    were folded into the multiplexed gateway. Return the single unit for
-    every profile so restart_round() targets the unit that actually exists.
+    Multiplex mode: one gateway unit (hermes-gateway.service) serves ALL
+    profiles. There are no per-profile gateway units anymore. Return the
+    single unit for every profile so restart_round() targets the unit that
+    actually exists.
     """
     return "hermes-gateway.service"
 
@@ -277,7 +277,7 @@ def probe_one(secrets: dict, model: str) -> dict:
     transient curl --config file (0600) in the system temp dir, used once,
     and deleted immediately. The key name (never its value) is logged.
     """
-    key = secrets.get("NVIDIA_API_KEY", "")
+    key = secrets.get(DEFAULT_API_KEY_ENV, "")
     tmp = tempfile.NamedTemporaryFile(
         "w", prefix="wd-probe-", suffix=".cfg", delete=False)
     try:
@@ -337,7 +337,7 @@ def probe(secrets: dict) -> dict:
     which the decision path uses to detect rotation-vs-restart (defects E/F).
     """
     targets = probe_models()
-    key = secrets.get("NVIDIA_API_KEY", "")
+    key = secrets.get(DEFAULT_API_KEY_ENV, "")
     primary, primary_source = targets[0]
     per_model = []
     first_body = ""
@@ -537,9 +537,9 @@ def notify(secrets: dict, text: str, key: str, cls: str = "") -> bool:
     if not chat_id():
         log("notify: WATCHDOG_CHAT_ID not configured — notification skipped (key name only)")
         return False
-    token = secrets.get("TELEGRAM_BOT_TOKEN", "")
+    token = secrets.get(DEFAULT_NOTIFY_TOKEN_ENV, "")
     if not token:
-        log("notify: TELEGRAM_BOT_TOKEN missing in env file (key name only) — skipped")
+        log(f"notify: {DEFAULT_NOTIFY_TOKEN_ENV} missing in env file (key name only) — skipped")
         return False
     payload = json.dumps({"chat_id": chat_id(),
                           "text": text})
@@ -650,7 +650,7 @@ def decide_restart(secrets: dict, burn: dict, det: dict) -> None:
     """Step 2a: probe OK, agents failing -> fresh processes for the affected.
 
     Defect E guard: "probe OK" can mean "some OTHER model is fine". If the
-    only model that answered is not the household default, restarting gives
+    only model that answered is not the configured default, restarting gives
     the poisoned agents a fresh process that still talks to the walled model —
     the operator needs rotation, not a restart.
     """

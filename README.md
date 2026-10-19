@@ -1,22 +1,21 @@
 # hermes-provider-watchdog
 
-**Provider failover watchdog for Hermes Agent.** Monitors NVIDIA NIM endpoint model
-availability, triggers automatic failover on terminal/soft failure signatures, and
-includes a child-worker watchdog for silent kanban child worker spawns. Tested
+**Provider failover watchdog for Hermes Agent.** Monitors LLM endpoint model
+availability, triggers automatic failover on terminal/soft failure signatures,
+and includes a child-worker watchdog for silent kanban child worker spawns. Tested
 hermetically with zero network (51/51 tests green).
 
-| | |
-|---|---|
-| **Owner** | pdjorgeluis |
-| **Status** | Active — DRY_RUN=1 until operator arms live mode |
+|| | |
+|---|---|---|
 | **License** | MIT |
+| **Status** | Active — DRY_RUN=1 until operator arms live mode |
 | **Tests** | 51 (hermetic, zero network) |
 
 ---
 
 ## What it is
 
-An independent, zero-LLM-cost watchdog that watches a Hermes Agent household's
+An independent, zero-LLM-cost watchdog that watches a Hermes Agent installation's
 LLM provider health by grepping the agents' own logs, probes the provider with a
 1-token request when failures accumulate, and acts on a probe-gated decision
 tree: restart poisoned gateway processes, or enforce total silence during a
@@ -43,10 +42,8 @@ it, and why it is shaped this way.
 directory is staged on the machine (the code resolves everything else relative
 to itself), and `$ENV_FILE` = the install's Hermes env file.
 
-**Origin:** built for Master Jorge's household (cards t_84db71fa →
-t_f35dec9e, spec `provider-failure-watchdog-plan.md` rev 2). The hermetic
-test suite is the smith's craft (Sindri); the implementation is the steward's
-(Crimvael). It runs in **DRY_RUN=1** until the operator arms it.
+Built for any Hermes Agent installation. The hermetic test suite is the craft
+of the implementer; the watchdog runs in **DRY_RUN=1** until the operator arms it.
 
 ---
 
@@ -184,10 +181,9 @@ Environment overrides: `DRY_RUN`, `WATCHDOG_STATE_DIR`, `WATCHDOG_ENV_FILE`,
   `~/.hermes/logs/`, other profiles at `~/.hermes/profiles/<name>/logs/`
   (`agent.log` + `errors.log` each).
 - A **single multiplexed gateway unit** `hermes-gateway.service` serves all
-  profiles (default, Isis, Sindri). There are no per-profile gateway units
-  post-multiplex migration; `service_name()` returns this unit for every
-  profile. (On a non-multiplex install, edit `service_name()` in
-  `provider_watchdog.py` — see INSTALL.md §Phase B.)
+  profiles. There are no per-profile gateway units post-multiplex migration;
+  `service_name()` returns this unit for every profile. (On a non-multiplex
+  install, edit `service_name()` in `provider_watchdog.py` — see INSTALL.md §Phase B.)
 - An env file containing the provider API key and the Telegram bot token as
   `KEY=VALUE` lines (both read at runtime; values never persisted anywhere).
 - Telegram: the bot must be able to DM the operator's chat id.
@@ -220,7 +216,7 @@ See `child_worker_watchdog.py` and `child_worker_watchdog.sh` for details.
 - **One manual cycle:** `"$WATCHDOG_DIR/provider_watchdog.sh"`
 - **Test suite:** `cd "$WATCHDOG_DIR" && python3 tests/run_tests.py`
 
-### Adding / removing agent profiles (household changes)
+### Adding / removing agent profiles (install changes)
 
 The profile list is per-install configuration, never code. When a new agent
 profile is born (or one retires):
@@ -256,14 +252,16 @@ Rollback: remove the name from the line and `daemon-reload` again.
 | `NOTIFY_DEDUP_S` | 300 | per-key page dedup |
 | `NOTIFY_MIN_INTERVAL_S` | 600 | hard floor between restart-intent notifications per class |
 
-Household-specific **configuration** is per-install environment, never code
-edits (see `INSTALL.md` Phase B): `WATCHDOG_PROFILES` (profile names),
+Install-specific **configuration** is per-install environment, never code
+edits (see `INSTALL.md` §Phase B): `WATCHDOG_PROFILES` (profile names),
 `WATCHDOG_CHAT_ID` (operator chat id — unset means detect/probe/log but
 never notify), `WATCHDOG_PROBE_MODEL` (explicit probe-model override —
 unset means auto-resolve from the profiles' `model.default`), and
 `WATCHDOG_FALLBACK_MODEL` (optional second probe target). Only-if-different
-code constants: `API_URL`, `DEFAULT_PROBE_MODEL`, `service_name()` mapping,
-env key names.
+code constants: `API_URL` (via `WATCHDOG_API_URL`), `DEFAULT_PROBE_MODEL`
+(via `WATCHDOG_PROBE_MODEL`), API key env name (via `WATCHDOG_API_KEY_ENV`),
+notify token env name (via `WATCHDOG_NOTIFY_TOKEN_ENV`), `service_name()`
+mapping, env key names.
 
 Any change to burn semantics must keep ONE formula feeding snapshot and
 notification (THE RULING), and the test suite is rewritten to match a binding
@@ -311,4 +309,4 @@ Four pre-existing tests amended, each citing defect C in an in-test comment
 
 ---
 
-*Authored by Crimvael, steward, at Master Jorge's order — 2026-10-16.\nThe suite is Sindri's craft; the house keeps it green.*
+*Provider-failure watchdog for Hermes Agent. DRY_RUN=1 by default; the operator arms live mode.*

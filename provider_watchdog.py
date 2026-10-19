@@ -44,18 +44,42 @@ HOUR_S = 3600
 ROUND_CAP_PER_HOUR = 2      # more than 2 restart rounds/hour -> stop acting, notify
 PROBE_TIMEOUT_S = 15
 NOTIFY_DEDUP_S = 300        # suppress a repeated notification key within 5 minutes
+NOTIFY_MIN_INTERVAL_S = 600  # hard floor between restart-intent notifications per class
+# defect D: the classes whose frequency is bounded by the hard floor. Stable
+# class names — never derived from the affected profile set, which rotates.
+RESTART_INTENT_CLASSES = ("would_restart", "pre_restart", "post_restart",
+                          "cooldown", "manual_attention")
 DEFAULT_PROFILES = ("default",)  # neutral; per-install list comes from WATCHDOG_PROFILES
 API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+DEFAULT_PROBE_MODEL = "stepfun-ai/step-5-preview"  # last-resort constant, source logged
 
-FAILURE_SIGNATURES = (
+# ---------------- failure signature tiers (defect C) ----------------
+# TERMINAL: lines that prove the provider gave up on that call. These ALONE
+# may trigger detection. SOFT: transient/retryable blips — Hermes retries
+# them up to 3 times and most recover — recorded as operator evidence
+# (detection.json per_profile.<p>.soft) but never able to trigger.
+
+TERMINAL_SIGNATURES = (
+    "failed after 3 retries",
+    "API failed after 3 retries",
+    "DEGRADED function cannot be invoked",
+)
+
+SOFT_SIGNATURES = (
     "Streaming failed before delivery",
     "API call failed (attempt",
     "Clean EOF, no finish_reason",
-    "API failed after",
-    "turn_failure: failure_reason=",
+    "API failed after",                      # non-"3 retries" prefix; the terminal
+                                            # "API failed after 3 retries" still
+                                            # matches TERMINAL above
     "HTTP/1.1 429 Too Many Requests",
     "HTTP/1.1 404 Not Found",
+    "turn_failure: failure_reason=",
 )
+
+# Kept as the union of both tiers so existing importers keep working: the
+# burn/detect log-scans that want "any interesting line" still find them all.
+FAILURE_SIGNATURES = TERMINAL_SIGNATURES + SOFT_SIGNATURES
 
 
 # ---------------- paths & environment ----------------
@@ -70,6 +94,82 @@ def profiles() -> tuple:
     if raw.strip():
         return tuple(p.strip() for p in raw.split(",") if p.strip())
     return DEFAULT_PROFILES
+
+
+def profile_config_path(profile: str) -> Path:
+    """Where a profile's config.yaml lives. The 'default' profile is the steward:
+    its config sits at ~/.hermes/config.yaml, everyone else under profiles/<p>/."""
+    base = home_dir() / ".hermes"
+    if profile != "default":
+        base = base / "profiles" / profile
+    return base / "config.yaml"
+
+
+def configured_model(profile: str) -> str:
+    """Minimal dependency-free parse of a profile's model.default (defect A).
+
+    Line scan, no yaml: the value of the first 'default:' line that follows a
+    line whose stripped form is exactly 'model:', within the first 30 lines.
+    The word 'default:' appears in unrelated blocks (stt:, tts:, ...) in this
+    host's real config, so a whole-file regex is wrong. Returns '' when nothing
+    resolves. Never raises: a malformed config is evidence, not a crash.
+    """
+    try:
+        lines = profile_config_path(profile).read_text().splitlines()[:30]
+    except OSError:
+        return ""
+    in_model_block = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "model:":
+            in_model_block = True
+            continue
+        if in_model_block and stripped.startswith("default:"):
+            return stripped[len("default:"):].strip().strip("\"'")
+    return ""
+
+
+def probe_models() -> list:
+    """Resolution order for the probe target(s), one entry per model to try.
+
+    1. WATCHDOG_PROBE_MODEL env (explicit per-install override) — alone.
+    2. model.default of the watched profiles, in WATCHDOG_PROFILES order,
+       scanning the default profile first (the steward), then the rest.
+    3. WATCHDOG_FALLBACK_MODEL env — probed AFTER the primary (defect B).
+    4. Module constant DEFAULT_PROBE_MODEL, when nothing resolves.
+
+    Returns [(model, source)] in probe order, deduplicated, never empty.
+    """
+    env_model = os.environ.get("WATCHDOG_PROBE_MODEL", "").strip()
+    if env_model:
+        return [(env_model, "env")]
+    ordered = ("default",) + tuple(p for p in profiles() if p != "default")
+    for prof in ordered:
+        model = configured_model(prof)
+        if model:
+            resolved = [(model, f"config({prof})")]
+            fallback = os.environ.get("WATCHDOG_FALLBACK_MODEL", "").strip()
+            if fallback and fallback != model:
+                resolved.append((fallback, "env"))
+            return resolved
+    fallback = os.environ.get("WATCHDOG_FALLBACK_MODEL", "").strip()
+    if fallback:
+        return [(fallback, "env")]
+    return [(DEFAULT_PROBE_MODEL, "constant")]
+
+
+def household_default_model() -> str:
+    """The model the household runs when all is well (defects E/F's yardstick).
+
+    Same resolution as probe_models() minus the fallback/env-probe escape
+    hatches: the configured model, else the module constant. Never ''.
+    """
+    ordered = ("default",) + tuple(p for p in profiles() if p != "default")
+    for prof in ordered:
+        model = configured_model(prof)
+        if model:
+            return model
+    return DEFAULT_PROBE_MODEL
 
 
 def chat_id() -> str:
@@ -163,8 +263,8 @@ def run_curl(argv: list) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S + 10)
 
 
-def probe(secrets: dict) -> dict:
-    """One 1-token chat completion from a fresh curl process.
+def probe_one(secrets: dict, model: str) -> dict:
+    """One 1-token chat completion for ONE model, from a fresh curl process.
 
     The API key never touches argv, logs, or state: it is written to a
     transient curl --config file (0600) in the system temp dir, used once,
@@ -180,7 +280,7 @@ def probe(secrets: dict) -> dict:
         tmp.write(f'header = "Authorization: Bearer {key}"\n')
         tmp.close()
         payload = json.dumps({
-            "model": "z-ai/glm-5.3",
+            "model": model,
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 1,
         })
@@ -209,21 +309,67 @@ def probe(secrets: dict) -> dict:
     elif m:
         http_status = m.group(1)
     ok = rc == 0 and "choices" in body
-    if http_status in ("429", "404", "500", "502", "503", "504") or (not ok and rc != 0):
+    if ok and http_status == "unknown":
+        # a clean completion is necessarily 2xx; curl -sS prints no status line
+        # on success, so the operator's evidence reads 200 (spec §1 defect B).
+        http_status = "200"
+    return {"model": model, "ok": ok, "http_status": http_status,
+            "exit_code": rc, "body_chars": len(body),
+            "body": body, "err": err}
+
+
+def probe(secrets: dict) -> dict:
+    """Multi-model probe (defect A + B): every resolved model gets 1 request.
+
+    Resolution order is probe_models()'s: env override, then the household's
+    configured model(s), then the fallback, then the module constant — with
+    the source of the primary logged. ok is True if ANY model succeeded, so a
+    model-scoped wall (primary 429, fallback 200) is still a usable provider
+    and never enters silence mode. per_model lists every model tried with its
+    status; res['model'] names the model that answered ('' when none did),
+    which the decision path uses to detect rotation-vs-restart (defects E/F).
+    """
+    targets = probe_models()
+    key = secrets.get("NVIDIA_API_KEY", "")
+    primary, primary_source = targets[0]
+    per_model = []
+    first_body = ""
+    last_rc = 0
+    for model, _source in targets:
+        r = probe_one(secrets, model)
+        per_model.append({k: r[k] for k in
+                          ("model", "ok", "http_status", "exit_code")})
+        if r["body"]:
+            first_body = first_body or r["body"]
+        last_rc = r["exit_code"]
+        if r["ok"]:
+            break  # a usable model answered — no need to probe further
+    ok = any(m["ok"] for m in per_model)
+    answered = next((m["model"] for m in per_model if m["ok"]), "")
+    body = first_body
+    http_status = next((m["http_status"] for m in per_model if m["ok"]),
+                       per_model[-1]["http_status"] if per_model else "unknown")
+    if not ok and http_status in ("429", "404", "500", "502", "503", "504"):
         # capture interesting failure bodies verbatim for the operator's evidence
         try:
             (state_dir() / "last_429_body.txt").write_text(body + "\n")
         except OSError:
             pass
     res = {"ts": time.time(), "ok": ok, "http_status": http_status,
-           "exit_code": rc, "body_chars": len(body)}
+           "exit_code": last_rc, "body_chars": len(body),
+           "model": answered, "models": [m for m, _s in targets],
+           "per_model": per_model}
     write_json("probe_result.json", res)
     try:
         # scrubbed body kept for inspection; the key never appears here
         (state_dir() / "probe_last_body.txt").write_text(body + "\n")
     except OSError:
         pass
-    log(f"probe: ok={ok} http_status={http_status} exit={rc}")
+    summary = " ".join(f"{m['model']}={'ok' if m['ok'] else 'fail'}({m['http_status']})"
+                       for m in per_model)
+    log(f"probe: models[{primary_source}]={primary} -> {summary}")
+    if ok:
+        log(f"probe: ok=True model={answered} http_status={http_status}")
     return res
 
 
@@ -313,20 +459,24 @@ def detect() -> dict:
     now = time.time()
     cutoff_detect = now - DETECT_WINDOW_S - SLACK_S
     cutoff_persist = now - PERSIST_LOOKBACK_S - SLACK_S
-    evidence = {}   # prof -> (recent_count, persisting_count)
+    evidence = {}   # prof -> (recent_terminal, persisting_terminal, soft_total)
     for prof in profiles():
         paths = list(log_paths(prof))
-        recent = lines_in_window(paths, cutoff_detect, FAILURE_SIGNATURES)
-        lookback = lines_in_window(paths, cutoff_persist, FAILURE_SIGNATURES)
+        # defect C: only TERMINAL signatures may trigger. SOFT signatures are
+        # recorded (per_profile.<p>.soft) as operator evidence but never count
+        # toward the decision — Hermes retries them and most recover on try 1-2.
+        recent = lines_in_window(paths, cutoff_detect, TERMINAL_SIGNATURES)
+        lookback = lines_in_window(paths, cutoff_persist, TERMINAL_SIGNATURES)
+        soft = lines_in_window(paths, cutoff_persist, SOFT_SIGNATURES)
         persisting = sum(1 for t, _l in lookback if t < cutoff_detect)
-        evidence[prof] = (len(recent), persisting)
+        evidence[prof] = (len(recent), persisting, len(soft))
     with_evidence = [p for p in profiles() if evidence[p][0] >= 1]
     if len(with_evidence) >= 2:
         # (b) >=2 profiles failing simultaneously — trigger even if each is young
         reason, affected = "multi-profile", with_evidence
     elif len(with_evidence) == 1:
         prof = with_evidence[0]
-        recent, persisting = evidence[prof]
+        recent, persisting = evidence[prof][0], evidence[prof][1]
         if recent >= 2 or persisting >= 1:
             # (a) failures persisting >= 5 minutes: a burst now, or older
             # evidence still inside the 15-min lookback
@@ -340,7 +490,9 @@ def detect() -> dict:
         "triggered": bool(affected),
         "reason": reason,
         "affected": affected,
-        "per_profile": {p: {"recent": evidence[p][0], "persisting": evidence[p][1]}
+        "per_profile": {p: {"recent": evidence[p][0],
+                            "persisting": evidence[p][1],
+                            "soft": evidence[p][2]}
                         for p in profiles()},
     }
     write_json("detection.json", det)
@@ -349,7 +501,7 @@ def detect() -> dict:
 
 # ---------------- notification ----------------
 
-def notify(secrets: dict, text: str, key: str) -> bool:
+def notify(secrets: dict, text: str, key: str, cls: str = "") -> bool:
     """Direct Telegram Bot API DM to the operator. No gateway dependency.
 
     Dedup: one notification per key per NOTIFY_DEDUP_S window.
@@ -357,9 +509,22 @@ def notify(secrets: dict, text: str, key: str) -> bool:
     config file (its url = https://api.telegram.org/bot<token>/sendMessage).
     The config appears AFTER the argv url, so curl uses the config's url while
     argv (and the mock's log) never sees the token.
+
+    cls (defect D): the notification's stable class name. Restart-intent
+    classes carry the hard 10-min floor; the affected profile set rides in
+    the message body, never in the key.
     """
     now = time.time()
     hist = read_json("notify_history.json", {})
+    # defect D: the class floor is checked FIRST and is always logged. A
+    # rotating affected-set must never resurrect a restart-intent notice:
+    # the class entry (class:<name>) is independent of the per-key entry.
+    if cls and cls in RESTART_INTENT_CLASSES:
+        last = hist.get(f"class:{cls}", 0)
+        if now - last < NOTIFY_MIN_INTERVAL_S:
+            log(f"notify[{cls}]: suppressed by 10-min class floor "
+                f"(last {int((now - last) // 60)}m ago)")
+            return False
     if hist.get(key) and now - hist[key] < NOTIFY_DEDUP_S:
         return False
     if not chat_id():
@@ -392,6 +557,8 @@ def notify(secrets: dict, text: str, key: str) -> bool:
         except OSError:
             pass
     hist[key] = now
+    if cls:
+        hist[f"class:{cls}"] = now
     write_json("notify_history.json", hist)
     log(f"notify[{key}]: attempted, delivered={ok}")
     return ok
@@ -415,25 +582,27 @@ def restart_round(secrets: dict, burn: dict, target_profiles: list, recovered=Fa
     blocked = [p for p in targets if now - stamps.get(p, 0) < RESTART_COOLDOWN_S]
     if blocked:
         log(f"restart round for {tkey} blocked by cooldown: {blocked}")
+        # defect D: the KEY stays stable (tkey rides in the body only); the
+        # class label carries the 10-min floor against a rotating profile set.
         notify(secrets, ("DRY-RUN — " if dry_run() else "") +
                f"watchdog: restart round for {tkey} blocked by 30-min cooldown (profiles: {', '.join(blocked)}).\n{burn_line(burn)}",
-               f"cooldown_{tkey}")
+               "cooldown", cls="cooldown")
         return False
     if len(rounds) >= ROUND_CAP_PER_HOUR:
         log("restart round blocked by hourly cap — manual attention needed")
         notify(secrets, ("DRY-RUN — " if dry_run() else "") +
                f"watchdog: {len(rounds)} restart rounds already this hour — cap reached, MANUAL ATTENTION NEEDED.\n{burn_line(burn)}",
-               f"manual_attention_{tkey}")
+               "manual_attention", cls="manual_attention")
         return False
     if dry_run():
         log(f"DRY-RUN: would restart {services}")
         why = "recovery: 2 consecutive OK probes" if recovered else "probe OK, agents poisoned"
         notify(secrets, f"DRY-RUN — watchdog: would restart {', '.join(services)} ({why}).\n{burn_line(burn)}",
-               f"would_restart_{tkey}")
+               "would_restart", cls="would_restart")
         return True
     why = "recovery: 2 consecutive OK probes" if recovered else "probe OK, agents poisoned"
     notify(secrets, f"watchdog: restarting {', '.join(services)} NOW ({why}).\n{burn_line(burn)}",
-           f"pre_restart_{tkey}")
+           "pre_restart", cls="pre_restart")
     for p in targets:
         subprocess.run(["systemctl", "--user", "restart", service_name(p)],
                       capture_output=True, timeout=60)
@@ -447,13 +616,40 @@ def restart_round(secrets: dict, burn: dict, target_profiles: list, recovered=Fa
     else:
         verb = f"watchdog: restart round complete: {', '.join(services)}."
     notify(secrets, f"{verb}\n{burn_line(burn)}",
-           f"post_restart_{tkey}")
+           "post_restart", cls="post_restart")
     log(f"restart round done: {services}")
     return True
 
 
+def recovery_from_non_default(res: dict) -> str:
+    """The model that answered, when it is NOT the household's configured
+    default (defects E/F). '' when the default model answered, when nothing
+    resolved, or when no model answered at all."""
+    answered = res.get("model", "")
+    default = household_default_model()
+    if answered and default and answered != default:
+        return answered
+    return ""
+
+
 def decide_restart(secrets: dict, burn: dict, det: dict) -> None:
-    """Step 2a: probe OK, agents failing -> fresh processes for the affected."""
+    """Step 2a: probe OK, agents failing -> fresh processes for the affected.
+
+    Defect E guard: "probe OK" can mean "some OTHER model is fine". If the
+    only model that answered is not the household default, restarting gives
+    the poisoned agents a fresh process that still talks to the walled model —
+    the operator needs rotation, not a restart.
+    """
+    res = read_json("probe_result.json", {})
+    answered = recovery_from_non_default(res)
+    if answered:
+        log(f"restart skipped: probe OK on {answered} but household default "
+            f"{household_default_model()} still walled — rotation needed, not restart")
+        notify(secrets, ("DRY-RUN — " if dry_run() else "") +
+               f"watchdog: probe OK on {answered} but household default "
+               f"{household_default_model()} still walled — MODEL ROTATION NEEDED, no restart performed.\n{burn_line(burn)}",
+               "model_rotation_needed", cls="model_rotation_needed")
+        return
     targets = list(profiles()) if len(det["affected"]) >= 2 else list(det["affected"])
     restart_round(secrets, burn, targets)
 
@@ -506,6 +702,19 @@ def handle_silence_phase(secrets: dict, burn: dict) -> None:
     silence["last_probe_ok"] = res["ok"]
     if res["ok"]:
         silence["ok_count"] = silence.get("ok_count", 0) + 1
+        answered = recovery_from_non_default(res)
+        if answered:
+            # defect F: recovery on a model the household does not run is not
+            # a recovery for the gateways — restarting them buys nothing.
+            silence["ok_count"] = 0
+            write_json("silence.json", silence)
+            log(f"silence: recovery probe OK on {answered} but household default "
+                f"{household_default_model()} still walled — restart round skipped, rotation needed")
+            notify(secrets, ("DRY-RUN — " if dry_run() else "") +
+                   f"watchdog: recovered on {answered}; household default "
+                   f"{household_default_model()} still walled — MODEL ROTATION NEEDED, restart skipped.\n{burn_line(burn)}",
+                   "model_rotation_needed", cls="model_rotation_needed")
+            return
         if silence["ok_count"] >= 2:
             silence["enforced"] = False
             silence["ok_count"] = 0

@@ -23,10 +23,10 @@ it, and why it is shaped this way.
 directory is staged on the machine (the code resolves everything else
 relative to itself), and `$ENV_FILE` = the install's Hermes env file.
 
-**Origin:** built for a multi-agent Hermes household (three agent profiles
-behind one provider, on a fragile free tier); the design is universal. The
-hermetic 29-test suite and the implementation were crafted under
-test-first discipline. It runs in **DRY_RUN=1** until the operator arms it.
+**Origin:** built for Master Jorge's household (cards t_84db71fa →
+t_f35dec9e, spec `provider-failure-watchdog-plan.md` rev 2). The hermetic
+26-test suite is the smith's craft (Sindri); the implementation is the
+steward's (Crimvael). It runs in **DRY_RUN=1** until the operator arms it.
 
 ---
 
@@ -200,12 +200,16 @@ Rollback: remove the name from the line and `daemon-reload` again.
 | `ROUND_CAP_PER_HOUR` | 2 | restart rounds/hour before manual-attention |
 | `PROBE_TIMEOUT_S` | 15 | curl timeout |
 | `NOTIFY_DEDUP_S` | 300 | per-key page dedup |
+| `NOTIFY_MIN_INTERVAL_S` | 600 | hard floor between restart-intent notifications per class |
 
 Household-specific **configuration** is per-install environment, never code
 edits (see `INSTALL.md` Phase B): `WATCHDOG_PROFILES` (profile names),
 `WATCHDOG_CHAT_ID` (operator chat id — unset means detect/probe/log but
-never notify). Only-if-different code constants: `API_URL` + probe model,
-`service_name()` mapping, env key names.
+never notify), `WATCHDOG_PROBE_MODEL` (explicit probe-model override —
+unset means auto-resolve from the profiles' `model.default`), and
+`WATCHDOG_FALLBACK_MODEL` (optional second probe target). Only-if-different
+code constants: `API_URL`, `DEFAULT_PROBE_MODEL`, `service_name()` mapping,
+env key names.
 
 Any change to burn semantics must keep ONE formula feeding snapshot and
 notification (THE RULING), and the test suite is rewritten to match a binding
@@ -225,5 +229,5 @@ ruling — never the reverse.
    logs, never state files; key NAMES may be logged, values never.
 6. **Every page carries the burn line** — observability ships with the alarm.
 
-*Documentation and procedure authored 2026-10-16. The suite is the smith's
-craft; the house keeps it green.*
+*Authored by Crimvael, steward, at Master Jorge's order — 2026-10-16. The
+suite is Sindri's craft; the house keeps it green.*

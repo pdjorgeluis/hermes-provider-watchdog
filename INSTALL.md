@@ -37,10 +37,8 @@ reinstall — report state and point the operator at README §Operations.
 1. Copy the ENTIRE `watchdog/` directory (code, `tests/` with `fixtures/`,
    `README.md`, this file) to the target machine; it must contain
    `provider_watchdog.py`, `provider_watchdog.sh`, `tests/run_tests.py`,
-   `tests/test_provider_watchdog.py`, `tests/fixtures/`. If it arrived as a
-   git clone, the directory is already staged — `export
-   WATCHDOG_DIR="$(pwd)"` from the repo root. If the package carries
-   `SHA256SUMS`, verify it first, from inside the staged directory:
+   `tests/test_provider_watchdog.py`, `tests/fixtures/`. If the package
+   carries `SHA256SUMS`, verify it first, from inside the staged directory:
    `sha256sum -c SHA256SUMS` — every line must print `OK`.
 2. Then:
    ```bash
@@ -68,10 +66,15 @@ values now (you will paste them in Phase D):
    operator, never guess). With this unset the watchdog still detects, probes,
    and logs — but never sends notifications.
 3. Only-if-different code constants (edit `provider_watchdog.py`, top of
-   file, ONLY if the target needs them): `API_URL` + the `"model"` inside
-   `probe()` for another provider endpoint; `service_name()` for differently
+   file, ONLY if the target needs them): `API_URL` for another provider
+   endpoint; `service_name()` for differently
    named gateway units; env key names in `read_env_secrets()` if the target's
    env file uses different variable names.
+4. `WATCHDOG_PROBE_MODEL` — optional explicit probe-model override (set in
+   the unit file). When unset, the probe resolves the model automatically:
+   first `model.default` of the watched profiles from their `config.yaml`
+   (default profile scanned first), then `WATCHDOG_FALLBACK_MODEL`, then the
+   module constant. The source used is logged on every probe.
 
 ## Phase C — Verify secrets WITHOUT ever printing them
 
@@ -213,5 +216,5 @@ full erasure is wanted.
 - [ ] Pager `DELIVERED=True`
 - [ ] Report delivered; live arming left to the operator
 
-*Install procedure extracted from the reference documentation, 2026-10-16 —
-paths genericized so any Hermes can raise a watchdog.*
+*Install procedure extracted from README.md at Master Jorge's order,
+2026-10-16 — paths genericized so any Hermes can raise a watchdog. — Crimvael*
